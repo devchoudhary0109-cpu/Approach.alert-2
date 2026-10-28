@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approach Alert</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; text-align: center; }
+  main { max-width: 520px; margin: 0 auto; padding: 16px; }
+  .video-wrap { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; }
+  video, canvas { width: 100%; display: block; }
+  canvas { position: absolute; top: 0; left: 0; }
+  input, select, button { font-size: 16px; padding: 10px; margin: 6px 0; width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #444; background: #222; color: #eee; }
+  button { background: #2b7cff; border: 0; font-weight: 600; }
+  button.secondary { background: #333; }
+  #status { margin: 10px 0; min-height: 1.5em; }
+  .alert { color: #ff5252; font-weight: 700; }
+  label { display: block; text-align: left; margin-top: 8px; font-size: 14px; color: #aaa; }
+</style>
+</head>
+<body>
+<main>
+  <h2>Approach Alert</h2>
+
+  <div id="setup">
+    <label>Your private ntfy topic (make it long and random)</label>
+    <input id="topic" placeholder="e.g. dev-door-8f3k29xq">
+    <label>Sensitivity</label>
+    <select id="sens">
+      <option value="1.4">Low (fewer alerts)</option>
+      <option value="1.25" selected>Medium</option>
+      <option value="1.15">High (more alerts)</option>
+    </select>
+    <button id="start">Start camera</button>
+    <button id="test" class="secondary">Send test notification</button>
+  </div>
+
+  <div class="video-wrap" id="videoWrap" style="display:none">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="status">Enter a topic and tap Start.</div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
+const statusEl = $('status');
+
+// Remember settings
+try {
+  $('topic').value = localStorage.getItem('topic') || '';
+  $('sens').value = localStorage.getItem('sens') || '1.25';
+} catch (e) {}
+
+const COOLDOWN_MS = 30000;   // minimum gap between alerts
+const WINDOW_MS = 2000;      // look at the last 2 seconds
+const MIN_SAMPLES = 4;
+let lastAlert = 0;
+let history = [];            // {t, h} person box heights
+let lastSeen = 0;
+
+function setStatus(msg, alert = false) {
+  statusEl.textContent = msg;
+  statusEl.className = alert ? 'alert' : '';
+}
+
+async function sendNotification(message, title = 'Someone is coming') {
+  const topic = $('topic').value.trim();
+  if (!topic) { setStatus('Please enter a topic first.'); return false; }
+  try {
+    await fetch('https://ntfy.sh/' + encodeURIComponent(topic), {
+      method: 'POST',
+      body: message,
+      headers: { 'Title': title, 'Priority': 'high', 'Tags': 'warning' }
+    });
+    return true;
+  } catch (e) {
+    setStatus('Could not send notification (check internet).');
+    return false;
+  }
+}
+
+$('test').onclick = async () => {
+  const ok = await sendNotification('This is a test from Approach Alert.', 'Test');
+  if (ok) setStatus('Test sent. Check your other phone.');
+};
+
+$('start').onclick = async () => {
+  const topic = $('topic').value.trim();
+  if (!topic) { setStatus('Please enter a topic first.'); return; }
+  try {
+    localStorage.setItem('topic', topic);
+    localStorage.setItem('sens', $('sens').value);
+  } catch (e) {}
+
+  setStatus('Starting camera...');
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw { name: 'NoMediaDevices', message: 'Camera API not available. Open in Chrome over HTTPS.' };
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false
+      });
+    } catch (e1) {
+      // fall back to any available camera
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    const hints = {
+      NotAllowedError: 'Permission denied. Set Camera to Allow in Chrome site settings, then reload.',
+      NotFoundError: 'No camera found on this device.',
+      NotReadableError: 'Camera is in use by another app. Close other apps using the camera and retry.',
+      NoMediaDevices: 'Camera API not available. Open in Chrome over HTTPS.'
+    };
+    setStatus('Camera error (' + (e.name || 'unknown') + '): ' + (hints[e.name] || e.message || ''));
+    return;
+  }
+
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {}
+
+  $('videoWrap').style.display = 'block';
+  $('setup').style.display = 'none';
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+
+  setStatus('Loading detection model...');
+  const model = await cocoSsd.load();
+  setStatus('Watching... keep this screen open and plugged in.');
+  loop(model);
+};
+
+function isApproaching(threshold) {
+  const now = performance.now();
+  history = history.filter(s => now - s.t <= WINDOW_MS);
+  if (history.length < MIN_SAMPLES) return false;
+  const first = history[0].h, last = history[history.length - 1].h;
+  if (first <= 0) return false;
+  const ratio = last / first;
+  let ups = 0;
+  for (let i = 1; i < history.length; i++) if (history[i].h >= history[i - 1].h) ups++;
+  const mostlyGrowing = ups / (history.length - 1) >= 0.6;
+  return ratio >= threshold && mostlyGrowing;
+}
+
+async function loop(model) {
+  const threshold = parseFloat($('sens').value);
+  while (true) {
+    const preds = await model.detect(video);
+    const people = preds.filter(p => p.class === 'person' && p.score > 0.6);
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    if (people.length) {
+      // use the biggest (closest) person
+      const p = people.reduce((a, b) => (b.bbox[3] > a.bbox[3] ? b : a));
+      const [x, y, w, h] = p.bbox;
+      const now = performance.now();
+      lastSeen = now;
+      history.push({ t: now, h });
+
+      const approaching = isApproaching(threshold);
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = approaching ? '#ff5252' : '#00e676';
+      ctx.strokeRect(x, y, w, h);
+
+      if (approaching) {
+        setStatus('Someone is approaching!', true);
+        if (now - lastAlert > COOLDOWN_MS) {
+          lastAlert = now;
+          sendNotification('A person is walking towards the camera.');
+        }
+      } else {
+        setStatus('Person visible (not approaching)');
+      }
+    } else {
+      if (performance.now() - lastSeen > 1000) history = [];
+      setStatus('Watching... no one in view.');
+    }
+    await new Promise(r => setTimeout(r, 250)); // ~4 checks per second
+  }
+}
+</script>
+</body>
+</html>
